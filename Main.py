@@ -1,116 +1,252 @@
 """
-[Task 5] Main.py
-Run counter-current HX simulation with saturated cold outlet target.
+Main.py  -  Water/Water PCHE 열교환기 1D 해석 [Task 5]
 
-The previous Tsat + 20 K target was not practically reachable with the
-quick-test setting. This version uses Tsat + 0 K first.
+역할 (과제 명세):
+    1) 시뮬레이션 실행 (함수호출)         : Optimizer.optimize 로 L 도출 + 노드별 분포
+    2) 데이터 저장 (csv)                   : 노드 / 셀 / summary 3종
+    3) 데이터 로드 및 시각화 (matplotlib)  : csv → DataFrame → 2×3 subplot
+
+전체 모듈 구성:
+    Data_model.py     : 고정조건 dataclass + CoolProp 물성치 래퍼
+    Physics_engine.py : 노드 단면의 (h, U, Re, Nu, f, v, ρ) 도출
+    Nodal_solver.py   : 향류 single-node 1-pass (에너지 보존 + 변수 업데이트)
+    Optimizer.py      : 공간 전진 sweep + cold 분포 수렴 + L 이분법
+    Main.py           : ↑ 통합 실행 + csv 저장 + 시각화 (이 파일)
+
+문제 조건:
+    Hot  (Water) : T_in 600 K, P_in 15.0 MPa, inlet velocity 2 m/s
+    Cold (Water): T_in 530 K, P_in 6.0 MPa, same mdot as hot side
+    Geometry      : Dh 2 mm, t_wall 1 mm, k_wall 20 W/m·K
+    Target        : cold-side outlet temperature = 550 K → 필요한 길이 L 도출 (대향류)
 """
 
-import matplotlib.pyplot as plt
-from Data_model import get_fixed_conditions
-from Optimizer import optimize_length, save_node_data, save_cold_flow_data, cold_flow_view
+from pathlib import Path
 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from Data_model import Geometry, Target, Numeric, make_water_inlets
+from Optimizer import optimize
+
+
+# =================================================================
+# 파일 경로 (Main.py 와 같은 폴더에 저장)
+# =================================================================
+
+HERE         = Path(__file__).parent
+NODES_CSV    = HERE / "exam_nodes.csv"
+CELLS_CSV    = HERE / "exam_cells.csv"
+SUMMARY_CSV  = HERE / "exam_summary.csv"
+
+
+# =================================================================
+# 1) 시뮬레이션 실행 + CSV 저장
+# =================================================================
 
 def run_simulation():
-    c = get_fixed_conditions()
-    geom_extra = {"A_flow_hot": 1e-3, "A_flow_cold": 1e-3, "P_w_hot": 0.628, "P_w_cold": 0.628,
-                  "correlation_model": c["model"]["correlation_model"]}
+    """Data_model 입력 → Optimizer.optimize → csv 3종 저장."""
+    geo    = Geometry()
+    target = Target()
+    hot, cold = make_water_inlets(geo, hot_velocity=2.0, target=target)
+    num    = Numeric()
 
-    print("=" * 60)
-    print("[Task 5] Counter-current full simulation")
-    print(f"Correlation model = {geom_extra['correlation_model']}")
-    print(f"Hot inlet       : x=0, P={c['hot_inlet']['P_in']/1e6:.2f} MPa, T={c['hot_inlet']['T_in']:.2f} K")
-    print(f"Cold inlet      : x=L, P={c['cold_inlet']['P_in']/1e6:.2f} MPa, T={c['cold_inlet']['T_in']:.2f} K")
-    print(f"Cold target out : x=0, T={c['target']['T_cold_out']:.2f} K = Tsat + {c['target']['superheat_margin_K']:.1f} K")
-    print("q'' is estimated from preliminary single-phase U*dT, not hard-coded.")
-    print("=" * 60)
+    print("=" * 64)
+    print("Water/Water PCHE Counter-current HX  -  Sizing Run")
+    print("=" * 64)
+    print(f"  Hot  : {hot.fluid:7s}  T_in={hot.T_in:7.2f} K ({hot.T_in-273.15:6.1f} °C), "
+          f"P_in={hot.P_in/1e6:5.2f} MPa, mdot={hot.mdot:.2f} kg/s")
+    print(f"  Cold : {cold.fluid:7s}  T_in={cold.T_in:7.2f} K ({cold.T_in-273.15:6.1f} °C), "
+          f"P_in={cold.P_in/1e6:5.2f} MPa, mdot={cold.mdot:.2f} kg/s")
+    print(f"  Geom : Dh={geo.Dh*1e3:.1f} mm, t_wall={geo.t_wall*1e3:.1f} mm, "
+          f"k_wall={geo.k_wall:.1f} W/m·K, N_channels={geo.N_channels}, "
+          f"boiling={geo.boiling_correlation}")
+    print(f"  Target T_cold_out = {target.T_cold_out:.2f} K ({target.T_cold_out-273.15:.2f} °C) "
+          f"(N={num.n_nodes} nodes, tol={num.tol})")
+    print("-" * 64)
 
-    def progress(it, L, T, err):
-        print(f"iter {it:02d}: L={L:9.4f} m | T_cold_out={T:9.3f} K | err={err:+8.3f} K")
+    L, result, x = optimize(geo, hot, cold, target, num)
+    x_mid = 0.5 * (x[:-1] + x[1:])
 
-    result = optimize_length(N=20, geom_extra=geom_extra, L_min=0.1, L_max=20.0, tol=0.5, max_iter=12, progress_cb=progress)
-    save_node_data(result["node_data"], "node_data_x_coordinate.csv")
-    save_node_data(result["node_data"], "node_data.csv")
-    save_cold_flow_data(result["node_data"], "cold_flow_node_data.csv")
+    # ---- 노드 경계 (N+1 행) ----
+    df_nodes = pd.DataFrame({
+        "x_m":      x,
+        "T_h_K":    result["T_h"],
+        "T_c_K":    result["T_c"],
+        "T_h_C":    result["T_h"] - 273.15,
+        "T_c_C":    result["T_c"] - 273.15,
+        "P_h_Pa":   result["P_h"],
+        "P_c_Pa":   result["P_c"],
+        "P_h_MPa":  result["P_h"] / 1.0e6,
+        "P_c_MPa":  result["P_c"] / 1.0e6,
+        "H_h_Jkg":  result["H_h"],
+        "H_c_Jkg":  result["H_c"],
+    })
 
-    nd = result["node_data"]
-    Q_total = sum(r.get("q_cell", 0.0) for r in nd)
-    print("\n" + "=" * 60)
-    print("Final result")
-    print(f"L = {result['L']:.5f} m")
-    print(f"Cold outlet at x=0 = {result['T_cold_out']:.3f} K")
-    print(f"Hot outlet at x=L  = {nd[-1]['T_hot']:.3f} K")
-    print(f"Q_total = {Q_total:.2f} W")
-    print(f"Converged = {result['converged']}")
-    print(f"Message = {result.get('message', '')}")
-    print("CSV saved: node_data_x_coordinate.csv, cold_flow_node_data.csv")
-    print("=" * 60)
-    return result
+    # ---- 셀 (N 행) ----
+    df_cells = pd.DataFrame({
+        "x_mid_m":  x_mid,
+        "h_hot":    result["h_hot"],
+        "h_cold":   result["h_cold"],
+        "U":        result["U"],
+        "Re_hot":   result["Re_hot"],
+        "Re_cold":  result["Re_cold"],
+        "Nu_hot":   result["Nu_hot"],
+        "Nu_cold":  result["Nu_cold"],
+        "f_hot":    result["f_hot"],
+        "f_cold":   result["f_cold"],
+        "v_hot":    result["v_hot"],
+        "v_cold":   result["v_cold"],
+        "q_node":   result["q_node"],
+        "q_cum":    np.cumsum(result["q_node"]),
+        "dP_h":     result["dP_h"],
+        "dP_c":     result["dP_c"],
+        "x_cold":  result.get("x_cold", np.full_like(x_mid, -1.0)),
+        "q_flux_est_Wm2": result.get("q_flux_est", np.full_like(x_mid, np.nan)),
+    })
+
+    # ---- Summary (에너지 보존 cross-check 포함, 전체 기준) ----
+    # sweep 은 단위 채널 기준 → q_node 도 단위 채널. 전체 환산은 × N_channels.
+    Q_total = float(np.sum(result["q_node"])) * geo.N_channels
+    Q_hot   = hot.mdot  * (result["H_h"][0]  - result["H_h"][-1])   # 전체 (mdot × ΔH)
+    Q_cold  = cold.mdot * (result["H_c"][0]  - result["H_c"][-1])   # 전체
+
+    summary = {
+        "L_m":             L,
+        "N_nodes":         num.n_nodes,
+        "N_channels":      geo.N_channels,
+        "cold_mdot_ratio": cold.mdot / hot.mdot,
+        "T_h_in_C":        hot.T_in - 273.15,
+        "T_h_out_C":       result["T_h"][-1] - 273.15,
+        "T_c_in_C":        cold.T_in - 273.15,
+        "T_c_out_C":       result["T_c"][0]  - 273.15,
+        "T_c_target_C":    target.T_cold_out - 273.15,
+        "P_h_in_MPa":      hot.P_in  / 1.0e6,
+        "P_h_out_MPa":     result["P_h"][-1] / 1.0e6,
+        "P_c_in_MPa":      result["P_c"][-1] / 1.0e6,
+        "P_c_out_MPa":     result["P_c"][0]  / 1.0e6,
+        "P_c_target_MPa":   target.P_cold_out / 1.0e6,
+        "dP_h_kPa":        (hot.P_in  - result["P_h"][-1]) / 1.0e3,
+        "dP_c_kPa":        (result["P_c"][-1] - result["P_c"][0])  / 1.0e3,
+        "Q_total_W":       Q_total,
+        "Q_hot_W":         float(Q_hot),
+        "Q_cold_W":        float(Q_cold),
+        "U_avg_Wm2K":      float(np.mean(result["U"])),
+        "boiling_correlation": geo.boiling_correlation,
+        "max_cold_quality": float(np.nanmax(result.get("x_cold", [-1.0]))),
+        "optimizer_converged": bool(result.get("converged", False)),
+        "target_residual_K": float(result.get("target_residual_K", result["T_c"][0] - target.T_cold_out)),
+    }
+    df_summary = pd.DataFrame([summary])
+
+    df_nodes  .to_csv(NODES_CSV,   index=False, encoding="utf-8-sig")
+    df_cells  .to_csv(CELLS_CSV,   index=False, encoding="utf-8-sig")
+    df_summary.to_csv(SUMMARY_CSV, index=False, encoding="utf-8-sig")
+
+    if summary["optimizer_converged"]:
+        print(f"  L_required        = {L:10.6f}  m")
+    else:
+        print(f"  L_best_checked    = {L:10.6f}  m  (target not reached)")
+    print(f"  T_h : in/out      = {summary['T_h_in_C']:7.2f} / {summary['T_h_out_C']:7.2f}  °C")
+    print(f"  T_c : in/out      = {summary['T_c_in_C']:7.2f} / {summary['T_c_out_C']:7.2f}  °C  "
+          f"(target {summary['T_c_target_C']:.1f}, residual {summary['target_residual_K']:+.3f} K)")
+    print(f"  mdot cold/hot     = {summary['cold_mdot_ratio']:10.4f}")
+    print(f"  ΔP : hot / cold   = {summary['dP_h_kPa']:7.2f} / {summary['dP_c_kPa']:7.2f}  kPa")
+    print(f"  Q  : total / hot / cold = "
+          f"{Q_total/1e3:8.2f} / {Q_hot/1e3:8.2f} / {Q_cold/1e3:8.2f}  kW")
+    print(f"  U_avg             = {summary['U_avg_Wm2K']:10.2f}  W/m²K")
+    print("-" * 64)
+    print(f"  CSV saved:")
+    print(f"    {NODES_CSV.name}")
+    print(f"    {CELLS_CSV.name}")
+    print(f"    {SUMMARY_CSV.name}")
+    print("=" * 64)
 
 
-def plot_result(result):
-    nd = result["node_data"]
-    x = [r["x"] for r in nd]
-    T_hot = [r["T_hot"] for r in nd]
-    T_cold_x = [r["T_cold"] for r in nd]
-    U = [r.get("U", 0.0) for r in nd]
-    q_flux = [r.get("q_flux_sp", 0.0) for r in nd]
+# =================================================================
+# 2) CSV 로드 + 시각화
+# =================================================================
 
-    plt.figure()
-    plt.plot(x, T_hot, label="Hot, x direction")
-    plt.plot(x, T_cold_x, label="Cold shown on x-coordinate")
-    plt.xlabel("x [m]  (hot flow direction)")
-    plt.ylabel("Temperature [K]")
-    plt.title("Temperature profile on x-coordinate")
-    plt.grid(True)
-    plt.legend()
+def load_and_plot():
+    """csv 다시 읽어 2×3 subplot으로 시각화."""
+    df_nodes   = pd.read_csv(NODES_CSV)
+    df_cells   = pd.read_csv(CELLS_CSV)
+    df_summary = pd.read_csv(SUMMARY_CSV)
+
+    L_val    = df_summary["L_m"].iloc[0]
+    target_C = df_summary["T_c_target_C"].iloc[0]
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+    fig.suptitle(
+        f"Water/Water PCHE Counter-current HX  (L = {L_val:.4f} m)",
+        fontsize=14, fontweight="bold",
+    )
+
+    # (0,0) 온도 분포
+    ax = axes[0, 0]
+    ax.plot(df_nodes["x_m"], df_nodes["T_h_C"], "r-",  lw=1.6, label="Hot Water")
+    ax.plot(df_nodes["x_m"], df_nodes["T_c_C"], "b-",  lw=1.6, label="Cold Water")
+    ax.axhline(target_C, color="k", linestyle=":", lw=0.9,
+               label=f"Target {target_C:.0f} °C")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("Temperature [°C]")
+    ax.set_title("Temperature Profile")
+    ax.grid(alpha=0.3); ax.legend()
+
+    # (0,1) 압력 분포
+    ax = axes[0, 1]
+    ax.plot(df_nodes["x_m"], df_nodes["P_h_MPa"], "r-", lw=1.6, label="Hot Water")
+    ax.plot(df_nodes["x_m"], df_nodes["P_c_MPa"], "b-", lw=1.6, label="Cold Water")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("Pressure [MPa]")
+    ax.set_title("Pressure Profile")
+    ax.grid(alpha=0.3); ax.legend()
+
+    # (0,2) 열전달계수 h, U
+    ax = axes[0, 2]
+    ax.plot(df_cells["x_mid_m"], df_cells["h_hot"],  "r-",  lw=1.4, label="h_hot")
+    ax.plot(df_cells["x_mid_m"], df_cells["h_cold"], "b-",  lw=1.4, label="h_cold")
+    ax.plot(df_cells["x_mid_m"], df_cells["U"],      "k--", lw=1.4, label="U (overall)")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("HTC [W/m²K]")
+    ax.set_title("Heat Transfer Coefficients")
+    ax.grid(alpha=0.3); ax.legend()
+
+    # (1,0) Reynolds
+    ax = axes[1, 0]
+    ax.plot(df_cells["x_mid_m"], df_cells["Re_hot"],  "r-", lw=1.4, label="Re_hot")
+    ax.plot(df_cells["x_mid_m"], df_cells["Re_cold"], "b-", lw=1.4, label="Re_cold")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("Reynolds Number")
+    ax.set_title("Reynolds Number")
+    ax.grid(alpha=0.3); ax.legend()
+
+    # (1,1) Nusselt
+    ax = axes[1, 1]
+    ax.plot(df_cells["x_mid_m"], df_cells["Nu_hot"],  "r-", lw=1.4, label="Nu_hot")
+    ax.plot(df_cells["x_mid_m"], df_cells["Nu_cold"], "b-", lw=1.4, label="Nu_cold")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("Nusselt Number")
+    ax.set_title("Nusselt Number")
+    ax.grid(alpha=0.3); ax.legend()
+
+    # (1,2) 누적 열량
+    ax = axes[1, 2]
+    ax.plot(df_cells["x_mid_m"], df_cells["q_cum"] / 1.0e3,
+            "g-", lw=1.6, label="cumulative q")
+    ax.set_xlabel("Axial position x [m]")
+    ax.set_ylabel("Cumulative Q [kW]")
+    ax.set_title("Cumulative Heat Transfer")
+    ax.grid(alpha=0.3); ax.legend()
+
     plt.tight_layout()
-    plt.savefig("temperature_profile_x_coordinate.png", dpi=200)
+    plt.show()
 
-    cold = cold_flow_view(nd)
-    s = [r["s_cold"] for r in cold]
-    T_cold = [r["T_cold"] for r in cold]
-    P_cold = [r["P_cold"] / 1e6 for r in cold]
 
-    plt.figure()
-    plt.plot(s, T_cold)
-    plt.xlabel("s_cold [m]  (cold actual flow direction)")
-    plt.ylabel("Cold temperature [K]")
-    plt.title("Cold temperature along actual cold-flow direction")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("cold_temperature_flow_direction.png", dpi=200)
-
-    plt.figure()
-    plt.plot(s, P_cold)
-    plt.xlabel("s_cold [m]  (cold actual flow direction)")
-    plt.ylabel("Cold pressure [MPa]")
-    plt.title("Cold pressure along actual cold-flow direction")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("cold_pressure_flow_direction.png", dpi=200)
-
-    plt.figure()
-    plt.plot(x, q_flux)
-    plt.xlabel("x [m]")
-    plt.ylabel("q'' estimate [W/m²]")
-    plt.title("Estimated heat-flux profile")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("heat_flux_profile.png", dpi=200)
-
-    plt.figure()
-    plt.plot(x, U)
-    plt.xlabel("x [m]")
-    plt.ylabel("U [W/m²-K]")
-    plt.title("Overall heat-transfer coefficient profile")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("U_profile.png", dpi=200)
-
-    print("Plots saved.")
-
+# =================================================================
+# Entry point
+# =================================================================
 
 if __name__ == "__main__":
-    result = run_simulation()
-    plot_result(result)
+    run_simulation()
+    load_and_plot()

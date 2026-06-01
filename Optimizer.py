@@ -1,171 +1,210 @@
 """
-[Task 4] Optimizer.py
-Counter-current space marching with shooting method.
+Optimizer.py  -  Water/Water PCHE 열교환기 1D 해석 [Task 4]
 
-x-coordinate data:
-    x=0 is hot inlet and cold outlet.
-    x=L is hot outlet and cold inlet.
+역할:
+    cold water 출구 온도가 목표값이 되도록 열교환기 길이 L을 찾는다.
+    동시에 노드별 데이터(온도/압력/엔탈피/h/U/Re/Nu/f/v/q/ΔP)를 배열로 저장한다.
 
-Cold-flow data:
-    reversed order of x-coordinate data.
-    This is the physically intuitive cold-flow direction, where cold temperature rises
-    and cold pressure drops along the flow.
+규칙(과제 명세):
+    - 공간 전진 루프      : 노드 i = 0..N-1 forward sweep
+    - 출구압력 가정 + 수렴: cold side 분포(T,P)를 초기 가정 후 sweep 반복으로 수렴
+    - 노드별 데이터 배열  : numpy ndarray 로 저장
+    - 최종 길이 L 반환    : 외부 이분법(bisection) 으로 root-finding
+    - 별도 물리계산 금지  : solve_node 호출만 수행 (h/U/f/v/ρ 직접 계산 X)
+
+루프 구조 (명세 매핑):
+    [외부]  L 이분법                     : (T_c_outlet - T_target) → 0  (Numeric.tol, max_iter)
+    [중간]  cold 분포 + 출구압력 수렴    : sweep 반복             (Numeric.tol, max_iter)
+    [내부]  공간 전진 sweep              : node i=0..N-1 forward, solve_node 1회/노드
+
+향류 인덱싱:
+              i=0          i=1                    i=N-1        i=N
+    hot   :  T_h_in ─→  T_h[1]  ─→ ...  ─→  T_h[N-1]  ─→  T_h[N]
+    cold  :  T_c[0] ←─  T_c[1]  ←─ ...  ←─  T_c[N-1]  ←─  T_c_in
+
+    노드 i의 입력 = (T_h[i], T_c[i+1]),  출력 = (T_h[i+1], T_c[i])
 """
 
-import csv
-from Data_model import get_fixed_conditions, H_from_PT, T_from_PH
-from Nodal_solver import advance_single_cell
+import numpy as np
+
+from Data_model import Geometry, HotInlet, ColdInlet, Target, Numeric, H_from_PT, T_from_PH
+from Physics_engine import compute_node
 
 
-def _make_geom(c, geom_extra):
-    return {"A_flow_hot": geom_extra["A_flow_hot"], "A_flow_cold": geom_extra["A_flow_cold"],
-            "P_w_hot": geom_extra["P_w_hot"], "P_w_cold": geom_extra["P_w_cold"],
-            "D_h": c["geometry"]["D_h"], "t_wall": c["geometry"]["t_wall"], "k_wall": c["geometry"]["k_wall"],
-            "correlation_model": geom_extra.get("correlation_model", c["model"].get("correlation_model", "chen"))}
+# =================================================================
+# 공간 전진 sweep + cold 분포 수렴 (한 L 후보에 대한 해석)
+# =================================================================
+
+def _allocate_arrays(N):
+    """노드별 결과 배열 사전 할당."""
+    return {
+        # 노드 경계값 (N+1)
+        "T_h": np.zeros(N + 1), "P_h": np.zeros(N + 1), "H_h": np.zeros(N + 1),
+        "T_c": np.zeros(N + 1), "P_c": np.zeros(N + 1), "H_c": np.zeros(N + 1),
+        # 셀(노드 내부) 값 (N)
+        "h_hot":  np.zeros(N), "h_cold": np.zeros(N), "U":      np.zeros(N),
+        "Re_hot": np.zeros(N), "Re_cold": np.zeros(N),
+        "Nu_hot": np.zeros(N), "Nu_cold": np.zeros(N),
+        "f_hot":  np.zeros(N), "f_cold":  np.zeros(N),
+        "v_hot":  np.zeros(N), "v_cold":  np.zeros(N),
+        "q_node": np.zeros(N), "dP_h":    np.zeros(N), "dP_c":   np.zeros(N),
+        "x_cold": np.full(N, -1.0), "q_flux_est": np.full(N, np.nan),
+    }
 
 
-def march_with_guess(L, N, T_cold_x0_guess, P_cold_x0_guess, geom_extra):
-    c = get_fixed_conditions()
-    fc_hot, fc_cold = c["hot_inlet"], c["cold_inlet"]
-    geom = _make_geom(c, geom_extra)
+def forward_sweep(L, geo: Geometry,
+                  hot: HotInlet, cold: ColdInlet,
+                  target: Target, num: Numeric):
+    """
+    주어진 L에 대해 공간 전진 sweep 을 수행하고 노드별 분포를 반환한다.
+    cold 분포는 초기 추정 후 sweep 반복으로 수렴시킨다 (출구압력 포함).
+    """
+    N  = num.n_nodes
     dx = L / N
+    arr = _allocate_arrays(N)
 
-    hot = {"fluid": fc_hot["fluid"], "P": fc_hot["P_in"], "H": H_from_PT(fc_hot["fluid"], fc_hot["P_in"], fc_hot["T_in"]), "m_dot": fc_hot["m_dot"]}
-    cold = {"fluid": fc_cold["fluid"], "P": P_cold_x0_guess, "H": H_from_PT(fc_cold["fluid"], P_cold_x0_guess, T_cold_x0_guess), "m_dot": fc_cold["m_dot"]}
+    # ----- 경계조건 (boundary) -----
+    # x=0: hot inlet and the specified cold outlet.
+    # Marching x=0 -> L moves opposite to the cold-flow direction, so cold
+    # pressure increases and cold enthalpy decreases toward the cold inlet.
+    arr["T_h"][0] = hot.T_in;   arr["P_h"][0] = hot.P_in
+    arr["T_c"][0] = target.T_cold_out;  arr["P_c"][0] = target.P_cold_out
+    arr["H_h"][0] = H_from_PT(hot.P_in,  hot.T_in,  hot.fluid)
+    arr["H_c"][0] = H_from_PT(target.P_cold_out, target.T_cold_out, cold.fluid)
 
-    node_data = []
-    for i in range(N + 1):
-        node_data.append({"node": i, "x": i * dx,
-                          "T_hot": T_from_PH(hot["fluid"], hot["P"], hot["H"]), "P_hot": hot["P"],
-                          "T_cold": T_from_PH(cold["fluid"], cold["P"], cold["H"]), "P_cold": cold["P"],
-                          "U": 0.0, "q_cell": 0.0, "q_flux_sp": 0.0,
-                          "phase_hot": "", "phase_cold": "", "x_hot": "", "x_cold": ""})
-        if i == N:
+    mdot_h_per_ch = hot.mdot  / geo.N_channels
+    mdot_c_per_ch = cold.mdot / geo.N_channels
+    A_ht = np.pi * geo.Dh * dx
+
+    for i in range(N):
+        state_h = {
+            "T": arr["T_h"][i], "P": arr["P_h"][i], "mdot": mdot_h_per_ch,
+            "fluid": hot.fluid, "H": arr["H_h"][i], "dx": dx,
+        }
+        state_c = {
+            "T": arr["T_c"][i], "P": arr["P_c"][i], "mdot": mdot_c_per_ch,
+            "fluid": cold.fluid, "H": arr["H_c"][i], "dx": dx,
+        }
+
+        info = compute_node(state_h, state_c, geo)
+        q_node = max(0.0, info["U"] * A_ht * (arr["T_h"][i] - arr["T_c"][i]))
+        q_node = min(q_node, mdot_h_per_ch * max(arr["H_h"][i] - H_from_PT(arr["P_h"][i], arr["T_c"][i], hot.fluid), 0.0))
+        q_node = min(q_node, mdot_c_per_ch * max(float(num.max_cold_dh_per_cell), 0.0))
+
+        rho_h = info["props_hot"]["rho"]
+        rho_c = info["props_cold"]["rho"]
+        dP_h = info["f_hot"] * (dx / geo.Dh) * 0.5 * rho_h * info["v_hot"] ** 2
+        dP_c = info["f_cold"] * (dx / geo.Dh) * 0.5 * rho_c * info["v_cold"] ** 2
+
+        arr["H_h"][i + 1] = arr["H_h"][i] - q_node / mdot_h_per_ch
+        arr["P_h"][i + 1] = arr["P_h"][i] - dP_h
+        arr["T_h"][i + 1] = T_from_PH(arr["P_h"][i + 1], arr["H_h"][i + 1], hot.fluid)
+
+        arr["H_c"][i + 1] = arr["H_c"][i] - q_node / mdot_c_per_ch
+        arr["P_c"][i + 1] = arr["P_c"][i] + dP_c
+        arr["T_c"][i + 1] = T_from_PH(arr["P_c"][i + 1], arr["H_c"][i + 1], cold.fluid)
+
+        arr["h_hot"][i]  = info["h_hot"];  arr["h_cold"][i] = info["h_cold"]
+        arr["U"][i]      = info["U"]
+        arr["Re_hot"][i] = info["Re_hot"]; arr["Re_cold"][i] = info["Re_cold"]
+        arr["Nu_hot"][i] = info["Nu_hot"]; arr["Nu_cold"][i] = info["Nu_cold"]
+        arr["f_hot"][i]  = info["f_hot"];  arr["f_cold"][i]  = info["f_cold"]
+        arr["v_hot"][i]  = info["v_hot"];  arr["v_cold"][i]  = info["v_cold"]
+        arr["q_node"][i] = q_node
+        arr["dP_h"][i]   = dP_h;           arr["dP_c"][i]    = dP_c
+        arr["x_cold"][i] = info.get("x_cold", -1.0)
+        arr["q_flux_est"][i] = info.get("q_flux_est", np.nan)
+
+    return arr
+
+
+# =================================================================
+# 외부 : L 이분법 (cold 출구 온도 = 목표 도달)
+# =================================================================
+
+def optimize(geo: Geometry,
+             hot: HotInlet, cold: ColdInlet,
+             target: Target, num: Numeric,
+             L_low: float = 0.01, L_high: float = 50.0):
+    """
+    cold 출구 온도가 target.T_cold_out 이 되는 L 을 이분법으로 탐색.
+
+    Returns
+    -------
+    L : float
+        목표를 만족하는 열교환기 길이 [m].
+    result : dict
+        해당 L 에서의 노드별 분포 (forward_sweep 반환과 동일).
+    x : ndarray
+        축방향 위치 좌표 [m] (노드 경계 N+1개).
+    """
+    if L_high > 2.0 * L_low:
+        L_scan = np.unique(np.r_[np.linspace(L_low, min(2.0, L_high), 7),
+                                 np.linspace(min(2.0, L_high), L_high, 7)])
+    else:
+        L_scan = np.linspace(L_low, L_high, max(9, min(13, num.max_iter + 1)))
+
+    scan = []
+    for L in L_scan:
+        result_L = forward_sweep(L, geo, hot, cold, target, num)
+        residual_L = result_L["T_c"][-1] - cold.T_in
+        scan.append((L, residual_L, result_L))
+
+    brackets = []
+    for (L_a, r_a, _), (L_b, r_b, _) in zip(scan[:-1], scan[1:]):
+        if abs(r_a) < num.tol:
+            scan[L_scan.tolist().index(L_a)][2]["converged"] = True
+            scan[L_scan.tolist().index(L_a)][2]["cold_inlet_residual_K"] = r_a
+            scan[L_scan.tolist().index(L_a)][2]["target_residual_K"] = 0.0
+            x = np.linspace(0.0, L_a, num.n_nodes + 1)
+            return L_a, scan[L_scan.tolist().index(L_a)][2], x
+        if r_a * r_b < 0.0:
+            brackets.append((L_a, L_b))
+
+    if not brackets:
+        L_best, residual_best, result_best = min(scan, key=lambda item: abs(item[1]))
+        result_best["converged"] = False
+        result_best["cold_inlet_residual_K"] = residual_best
+        result_best["target_residual_K"] = result_best["T_c"][0] - target.T_cold_out
+        print(
+            "  optimizer warning: target is not bracketed in "
+            f"{L_low:.4f}-{L_high:.4f} m; reporting closest checked result "
+            f"L={L_best:.4f} m, T_c_in={result_best['T_c'][-1]:.3f} K, "
+            f"inlet_residual={residual_best:.3f} K"
+        )
+        x = np.linspace(0.0, L_best, num.n_nodes + 1)
+        return L_best, result_best, x
+
+    L_lo, L_hi = brackets[0]
+    L_mid      = 0.5 * (L_lo + L_hi)
+    result     = None
+
+    for it in range(num.max_iter):
+        L_mid  = 0.5 * (L_lo + L_hi)
+        result = forward_sweep(L_mid, geo, hot, cold, target, num)
+
+        T_c_inlet = result["T_c"][-1]
+        residual = T_c_inlet - cold.T_in
+        print(
+            f"  optimizer {it+1:02d}/{num.max_iter}: L={L_mid:.4f} m, "
+            f"T_c_in={T_c_inlet:.3f} K, inlet_residual={residual:.3f} K"
+        )
+
+        if abs(residual) < num.tol:
             break
-        hot, cold, info = advance_single_cell(hot, cold, geom, dx)
-        node_data[-1].update({"U": info["U"], "q_cell": info["q_cell"], "q_flux_sp": info["q_flux_sp"],
-                              "phase_hot": info["phase_hot"], "phase_cold": info["phase_cold"],
-                              "x_hot": info["x_hot"], "x_cold": info["x_cold"]})
 
-    T_cold_at_L = node_data[-1]["T_cold"]
-    P_cold_at_L = node_data[-1]["P_cold"]
-    T_hot_at_L = node_data[-1]["T_hot"]
-    return T_cold_at_L, P_cold_at_L, T_hot_at_L, node_data
-
-
-def shoot_for_boundary(L, N, geom_extra, tol_T=0.2, tol_P=500.0, max_iter=15):
-    c = get_fixed_conditions()
-    T_cold_in = c["cold_inlet"]["T_in"]
-    P_cold_in = c["cold_inlet"]["P_in"]
-    T_target = c["target"]["T_cold_out"]
-
-    # In counter-current calculation, x=0 is the cold outlet.
-    # Therefore P_cold(x=0) must be lower than P_cold,in at x=L.
-    # The previous version updated P_guess directly and could overshoot below zero.
-    # Here P_guess is always clamped to a physically meaningful range.
-    P_MIN_GUESS = max(1.0e5, 0.05 * P_cold_in)
-    P_MAX_GUESS = P_cold_in - 1.0
-    P_guess = P_cold_in - 2.0e4
-
-    T_lo = T_cold_in + 0.1
-    T_hi = min(c["hot_inlet"]["T_in"] - 1.0, T_target + 30.0)
-    last = None
-
-    for _ in range(max_iter):
-        T_guess = 0.5 * (T_lo + T_hi)
-        P_guess = min(max(P_guess, P_MIN_GUESS), P_MAX_GUESS)
-
-        try:
-            T_L, P_L, T_hot_L, data = march_with_guess(L, N, T_guess, P_guess, geom_extra)
-        except ValueError:
-            # If a trial pressure/temperature becomes non-physical, move the
-            # guessed cold outlet pressure upward and reduce the cold outlet
-            # temperature guess. This prevents negative pressure calls to CoolProp.
-            P_guess = 0.5 * (P_guess + P_MAX_GUESS)
-            T_hi = T_guess
-            continue
-
-        last = (T_guess, P_guess, T_L, P_L, T_hot_L, data)
-
-        # Pressure correction: x=L should match the specified cold inlet pressure.
-        # Use a small relaxation and hard bounds to avoid negative pressure.
-        P_error = P_cold_in - P_L
-        P_guess = P_guess + 0.15 * P_error
-        P_guess = min(max(P_guess, P_MIN_GUESS), P_MAX_GUESS)
-
-        # Temperature shooting: x=L should match actual cold inlet temperature.
-        diff_T = T_L - T_cold_in
-        if abs(diff_T) < tol_T and abs(P_L - P_cold_in) < tol_P:
-            return T_guess, P_guess, data, True
-        if diff_T > 0:
-            T_hi = T_guess
-        else:
-            T_lo = T_guess
-
-    if last is None:
-        # Fallback: return a safe one-step result rather than crashing.
-        T_guess = 0.5 * (T_lo + T_hi)
-        P_guess = min(max(P_guess, P_MIN_GUESS), P_MAX_GUESS)
-        T_L, P_L, T_hot_L, data = march_with_guess(L, N, T_guess, P_guess, geom_extra)
-        last = (T_guess, P_guess, T_L, P_L, T_hot_L, data)
-    return last[0], last[1], last[5], False
-
-
-def optimize_length(N, geom_extra, L_min=0.1, L_max=20.0, tol=0.5, max_iter=12, progress_cb=None):
-    c = get_fixed_conditions()
-    T_target = c["target"]["T_cold_out"]
-    L_lo, L_hi = L_min, L_max
-    history = []
-    last_result = None
-
-    for it in range(1, max_iter + 1):
-        L_mid = 0.5 * (L_lo + L_hi)
-        T_x0, P_x0, node_data, ok_inner = shoot_for_boundary(L_mid, N, geom_extra)
-        diff = T_x0 - T_target
-        history.append((it, L_mid, T_x0, diff, ok_inner))
-        if progress_cb:
-            progress_cb(it, L_mid, T_x0, diff)
-        last_result = (L_mid, T_x0, P_x0, node_data, ok_inner)
-        if abs(diff) < tol and ok_inner:
-            break
-        if diff > 0:
-            L_hi = L_mid
-        else:
+        # L 증가 → x=L에서 역산된 cold inlet 온도 감소
+        if residual > 0.0:
             L_lo = L_mid
+        else:
+            L_hi = L_mid
 
-    L, T_x0, P_x0, node_data, ok = last_result
-    converged = ok and abs(T_x0 - T_target) < tol
-    message = "converged" if converged else (
-        "not converged: target may require a larger L_max, smaller cold flow rate, or higher hot inlet temperature"
+    result["converged"] = (
+        abs(result["T_c"][-1] - cold.T_in) < num.tol
+        and abs(result["T_c"][0] - target.T_cold_out) < num.tol
+        and abs(result["P_c"][0] - target.P_cold_out) < num.tol * target.P_cold_out
     )
-    return {"L": L, "T_cold_out": T_x0, "P_cold_out": P_x0, "node_data": node_data,
-            "converged": converged, "message": message, "history": history, "N": N}
-
-
-def cold_flow_view(node_data):
-    reversed_data = []
-    nmax = len(node_data) - 1
-    for j, row in enumerate(reversed(node_data)):
-        r = dict(row)
-        r["cold_flow_node"] = j
-        r["s_cold"] = j / max(nmax, 1) * node_data[-1]["x"]
-        reversed_data.append(r)
-    return reversed_data
-
-
-def save_node_data(node_data, path):
-    keys = ["node", "x", "T_hot", "T_cold", "P_hot", "P_cold", "U", "q_cell", "q_flux_sp", "phase_hot", "phase_cold", "x_hot", "x_cold"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in node_data:
-            w.writerow({k: r.get(k, "") for k in keys})
-
-
-def save_cold_flow_data(node_data, path):
-    keys = ["cold_flow_node", "s_cold", "node", "x", "T_cold", "P_cold", "phase_cold", "x_cold", "T_hot", "P_hot", "U", "q_cell", "q_flux_sp"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in cold_flow_view(node_data):
-            w.writerow({k: r.get(k, "") for k in keys})
+    result["target_residual_K"] = result["T_c"][0] - target.T_cold_out
+    result["cold_inlet_residual_K"] = result["T_c"][-1] - cold.T_in
+    x = np.linspace(0.0, L_mid, num.n_nodes + 1)
+    return L_mid, result, x

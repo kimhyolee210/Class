@@ -1,153 +1,127 @@
 """
-[Task 2] Physics_engine.py
-Phase-aware heat-transfer calculation.
+Physics_engine.py  -  Water/Water boiling heat-exchanger 1D analysis [Task 2]
 
-- Single-phase liquid/vapor: Dittus-Boelter based h
-- Two-phase heating: selected boiling correlation from correlation.py
-- q'' is estimated outside as q_flux_sp = U_single_phase * DeltaT and passed in.
+Cold side can become two-phase. In subcooled/superheated single-phase
+regions, Dittus-Boelter is used. In 0 < quality < 1, the selected boiling
+correlation in Geometry.boiling_correlation is used through correlation.py.
 """
 
-import math
-from Data_model import get_state, get_state_PH, T_from_PH, sat_props, phase_from_PH
-import correlation as corr
+import numpy as np
+
+from Data_model import Geometry, props_PT, phase_quality_PH
+from correlation import saturated_water_props, two_phase_boiling_h
 
 
-def velocity(m_dot, rho, A_flow):
-    return m_dot / (rho * A_flow)
-
-
-def reynolds(rho, V, D_h, mu):
-    return rho * V * D_h / mu
-
-
-def prandtl(Cp, mu, k):
-    return mu * Cp / k
-
-
-def nusselt_dittus_boelter(Re, Pr, mode="heating"):
-    if Re < 2300:
+def nusselt_DB(Re, Pr, mode):
+    """Single-phase forced convection Nusselt number."""
+    if Re < 2300.0:
         return 4.36
+    if mode == "heating":
+        return 0.023 * Re ** 0.8 * Pr ** 0.4
     if mode == "cooling":
-        return 0.0265 * Re ** 0.8 * Pr ** 0.3
-    return 0.0243 * Re ** 0.8 * Pr ** 0.4
-
-
-def htc(Nu, k, D_h):
-    return Nu * k / D_h
+        return 0.023 * Re ** 0.8 * Pr ** 0.3
+    raise ValueError(f"Unknown nusselt mode: {mode}")
 
 
 def friction_factor(Re):
-    if Re < 2300:
-        return 64.0 / max(Re, 1e-12)
-    return 0.25 / (math.log10(5.74 / (Re ** 0.9))) ** 2
+    """Darcy friction factor for a smooth circular channel."""
+    Re = max(float(Re), 1.0e-12)
+    if Re < 2300.0:
+        return 64.0 / Re
+    return (-1.8 * np.log10(6.9 / Re)) ** -2
 
 
-def overall_U(h_hot, h_cold, t_wall, k_wall):
-    return 1.0 / (1.0 / h_hot + t_wall / k_wall + 1.0 / h_cold)
+def _channel_area(Dh):
+    return 0.25 * np.pi * Dh ** 2
 
 
-def single_phase_node_from_PT(fluid, P, T, m_dot, A_flow, D_h, mode="heating"):
-    state = get_state(fluid, P, T)
-    V = velocity(m_dot, state["rho"], A_flow)
-    Re = reynolds(state["rho"], V, D_h, state["mu"])
-    Pr = prandtl(state["Cp"], state["mu"], state["k"])
-    Nu = nusselt_dittus_boelter(Re, Pr, mode=mode)
-    h = htc(Nu, state["k"], D_h)
+def _single_phase_transport(state, Dh, A_flow, mode):
+    pr = props_PT(state["P"], state["T"], state["fluid"])
+    v = state["mdot"] / (pr["rho"] * A_flow)
+    G = state["mdot"] / A_flow
+    Re = pr["rho"] * v * Dh / pr["mu"]
+    Nu = nusselt_DB(Re, pr["Pr"], mode)
+    h = Nu * pr["k"] / Dh
     f = friction_factor(Re)
     return {
-        "fluid": fluid, "P": P, "T": T, "H": state["H"], "phase": "single_phase",
-        "rho": state["rho"], "Cp": state["Cp"], "k": state["k"], "mu": state["mu"],
-        "V": V, "Re": Re, "Pr": Pr, "Nu": Nu, "h": h, "f": f, "x": None,
+        "props": pr, "v": v, "G": G, "Re": Re, "Pr": pr["Pr"],
+        "Nu": Nu, "h": h, "f": f, "quality": -1.0, "phase": "single",
+        "correlation": "Dittus-Boelter",
     }
 
 
+def _two_phase_cold_transport(state, Dh, A_flow, h_hot, R_wall, geo):
+    """Cold-side boiling h from the selected correlation."""
+    H = state.get("H")
+    if H is None:
+        return _single_phase_transport(state, Dh, A_flow, mode="heating")
 
+    x_raw = phase_quality_PH(state["P"], H, state["fluid"])
+    if not (0.0 < x_raw < 1.0):
+        return _single_phase_transport(state, Dh, A_flow, mode="heating")
 
-def single_phase_node_from_PH(fluid, P, H, m_dot, A_flow, D_h, mode="heating", phase_label="single_phase", x_value=None):
-    """
-    Single-phase node evaluated from P-H.
-    This is safer than P-T near the saturation boundary.
-    """
-    state = get_state_PH(fluid, P, H)
-    V = velocity(m_dot, state["rho"], A_flow)
-    Re = reynolds(state["rho"], V, D_h, state["mu"])
-    Pr = prandtl(state["Cp"], state["mu"], state["k"])
-    Nu = nusselt_dittus_boelter(Re, Pr, mode=mode)
-    h = htc(Nu, state["k"], D_h)
+    # Initial heat-flux estimate using saturated-liquid single-phase h.
+    sp = saturated_water_props(state["P"], state["fluid"])
+    G = state["mdot"] / A_flow
+    h_liq = _single_phase_transport(
+        {"T": sp.T_sat - 0.01, "P": state["P"], "mdot": state["mdot"], "fluid": state["fluid"]},
+        Dh, A_flow, mode="heating",
+    )["h"]
+    U_guess = 1.0 / (1.0 / h_hot + R_wall + 1.0 / h_liq)
+    dT = max(state.get("T_hot_ref", sp.T_sat + 1.0) - sp.T_sat, 1.0e-6)
+    q_flux = max(U_guess * dT, 1.0)
+
+    tp = two_phase_boiling_h(
+        name=geo.boiling_correlation,
+        x=x_raw,
+        G=G,
+        Dh=Dh,
+        q_flux=q_flux,
+        P=state["P"],
+        L=state.get("L_node", Dh),
+        fluid=state["fluid"],
+    )
+
+    rho_mix = tp["rho_mix"]
+    mu_mix = tp["mu_mix"]
+    v = state["mdot"] / (rho_mix * A_flow)
+    Re = G * Dh / mu_mix
     f = friction_factor(Re)
+    Nu = tp["h"] * Dh / max(sp.k_l, 1.0e-12)
     return {
-        "fluid": fluid, "P": P, "T": state["T"], "H": H, "phase": phase_label,
-        "rho": state["rho"], "Cp": state["Cp"], "k": state["k"], "mu": state["mu"],
-        "V": V, "Re": Re, "Pr": Pr, "Nu": Nu, "h": h, "f": f, "x": x_value,
+        "props": {"rho": rho_mix, "mu": mu_mix, "k": sp.k_l, "cp": np.nan, "Pr": np.nan},
+        "v": v, "G": G, "Re": Re, "Pr": np.nan, "Nu": Nu,
+        "h": tp["h"], "f": f, "quality": tp["x"], "phase": "two-phase",
+        "correlation": tp["correlation"], "T_sat": tp["T_sat"],
+        "Bo": tp["Bo"], "Co": tp["Co"], "Xtt": tp["Xtt"],
+        "q_flux_est": q_flux,
     }
 
-def saturated_single_phase_node(fluid, P, quality, m_dot, A_flow, D_h, mode="heating"):
-    s = sat_props(P, fluid)
-    if quality <= 0:
-        rho, Cp, k, mu, H = s["rho_l"], s["Cp_l"], s["k_l"], s["mu_l"], s["H_l"]
-    else:
-        rho, Cp, k, mu, H = s["rho_g"], s["Cp_g"], s["k_g"], s["mu_g"], s["H_g"]
-    V = velocity(m_dot, rho, A_flow)
-    Re = reynolds(rho, V, D_h, mu)
-    Pr = prandtl(Cp, mu, k)
-    Nu = nusselt_dittus_boelter(Re, Pr, mode=mode)
-    h = htc(Nu, k, D_h)
-    f = friction_factor(Re)
-    return {"fluid": fluid, "P": P, "T": s["T_sat"], "H": H, "phase": "sat_liq" if quality <= 0 else "sat_vap",
-            "rho": rho, "Cp": Cp, "k": k, "mu": mu, "V": V, "Re": Re, "Pr": Pr, "Nu": Nu, "h": h, "f": f, "x": quality}
 
+def compute_node(state_hot, state_cold, geo: Geometry):
+    """Return hot/cold h, U, Re, Nu, f, v and phase information for one node."""
+    A_flow = _channel_area(geo.Dh)
+    R_wall = geo.t_wall / geo.k_wall
 
-def evaluate_node_from_PH(fluid, P, H, m_dot, A_flow, D_h, mode="heating", correlation_model="single_phase", q_flux_sp=None, P_H=None, P_F=None):
-    phase, x = phase_from_PH(fluid, P, H)
+    hot = _single_phase_transport(state_hot, geo.Dh, A_flow, mode="cooling")
 
-    # For true single-phase states, evaluate properties with P-H rather than P-T.
-    # This prevents CoolProp saturation-line errors when T is extremely close to Tsat.
-    if phase == "subcooled_liquid" or phase == "superheated_vapor":
-        return single_phase_node_from_PH(fluid, P, H, m_dot, A_flow, D_h, mode=mode, phase_label=phase, x_value=x)
+    cold_state = dict(state_cold)
+    cold_state["T_hot_ref"] = state_hot["T"]
+    cold_state["L_node"] = state_cold.get("dx", geo.Dh)
+    cold = _two_phase_cold_transport(cold_state, geo.Dh, A_flow, hot["h"], R_wall, geo)
 
-    # Two-phase region. Even if correlation_model == "single_phase", do NOT call
-    # single_phase_node_from_PT at Tsat. Use saturated properties and quality.
-    s = sat_props(P, fluid)
-    h_fg = s["H_g"] - s["H_l"]
-    G_mass = m_dot / A_flow
-    q_flux = abs(q_flux_sp) if q_flux_sp is not None else 0.0
+    U = 1.0 / (1.0 / hot["h"] + R_wall + 1.0 / cold["h"])
 
-    liq = saturated_single_phase_node(fluid, P, 0, m_dot, A_flow, D_h, mode=mode)
-    vap = saturated_single_phase_node(fluid, P, 1, m_dot, A_flow, D_h, mode=mode)
-    h_sp = liq["h"]
-    h_pool = corr.cooper_pool_boiling(q_flux, P / s["P_crit"])
-    rho_mix = 1.0 / ((1.0 - x) / s["rho_l"] + x / s["rho_g"])
-    mu_mix = (1.0 - x) * s["mu_l"] + x * s["mu_g"]
-    V_mix = velocity(m_dot, rho_mix, A_flow)
-    Re_mix = reynolds(rho_mix, V_mix, D_h, mu_mix)
-    f_mix = friction_factor(Re_mix)
-
-    model = correlation_model.lower()
-    if mode == "cooling" or model == "single_phase":
-        # PDF correlations are boiling/heating correlations.
-        # For hot-side condensation or for a preliminary single-phase estimate,
-        # use a saturated-mixture fallback without any P-T call at Tsat.
-        h = (1.0 - x) * liq["h"] + x * vap["h"]
-    elif model == "chen":
-        h = corr.chen_correlation(h_sp, h_pool, Re_mix, liq["Re"], S=1.0)
-    elif model == "shah":
-        h = corr.shah_correlation(h_sp, x, q_flux, G_mass, h_fg, s["rho_l"], s["rho_g"], D_h)
-    elif model == "gungor_winterton":
-        h = corr.gungor_winterton_correlation(h_sp, h_pool, x, q_flux, G_mass, h_fg, s["rho_l"], s["rho_g"], s["mu_l"], s["mu_g"], liq["Re"])
-    elif model == "bertsch":
-        h = corr.bertsch_correlation(liq["h"], vap["h"], h_pool, x, s["sigma"], s["rho_l"], s["rho_g"], D_h)
-    elif model == "kim_mudawar":
-        h = corr.kim_mudawar_correlation(h_sp, x, q_flux, G_mass, h_fg, P, s["P_crit"], s["rho_l"], s["rho_g"], s["mu_l"], s["mu_g"], s["sigma"], D_h, P_H or 1.0, P_F or 1.0)
-    elif model == "zhang":
-        X = corr.x_tt(x, s["rho_l"], s["rho_g"], s["mu_l"], s["mu_g"])
-        h = corr.zhang_correlation(vap["h"], h_pool, X)
-    else:
-        h = h_sp
-
-    return {"fluid": fluid, "P": P, "T": s["T_sat"], "H": H, "phase": "two_phase", "x": x,
-            "rho": rho_mix, "Cp": None, "k": None, "mu": mu_mix, "V": V_mix,
-            "Re": Re_mix, "Pr": None, "Nu": None, "h": h, "f": f_mix}
-
-
-def compute_U_for_pair(hot_node, cold_node, t_wall, k_wall):
-    return overall_U(hot_node["h"], cold_node["h"], t_wall, k_wall)
+    return {
+        "h_hot": hot["h"], "h_cold": cold["h"], "U": U,
+        "Re_hot": hot["Re"], "Re_cold": cold["Re"],
+        "Nu_hot": hot["Nu"], "Nu_cold": cold["Nu"],
+        "f_hot": hot["f"], "f_cold": cold["f"],
+        "v_hot": hot["v"], "v_cold": cold["v"],
+        "props_hot": hot["props"], "props_cold": cold["props"],
+        "A_flow": A_flow, "R_wall": R_wall,
+        "x_cold": cold.get("quality", -1.0),
+        "phase_cold": cold.get("phase", "single"),
+        "boiling_correlation": cold.get("correlation", "Dittus-Boelter"),
+        "q_flux_est": cold.get("q_flux_est", np.nan),
+    }
