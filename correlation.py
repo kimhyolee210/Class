@@ -9,6 +9,8 @@ Implemented correlations:
     4. Bertsch et al. correlation
     5. Kim & Mudawar correlation
     6. Zhang correlation
+    7. Del Col et al. dryout-inception quality
+    8. Dougall & Rohsenow post-dryout correlation
 
 All inputs/outputs use SI units.
 The formulas follow the lecture PDF pages 5-10. Some nucleate-boiling
@@ -121,6 +123,86 @@ def convection_number(x: float, sp: SatWaterProps) -> float:
 def boiling_number(q_flux: float, G: float, sp: SatWaterProps) -> float:
     """Boiling number Bo = q''/(G h_fg)."""
     return abs(q_flux) / max(G * sp.h_fg, EPS)
+
+
+def del_col_dryout_quality(G: float, Dh: float, q_flux: float, P: float, sp: SatWaterProps) -> tuple[float, float]:
+    """Del Col et al. (2010) dryout-inception quality x_di and R_LL.
+
+    The expression is evaluated with SI inputs exactly as shown in the
+    supplied correlation. The returned x_di is limited to [0, 1].
+    """
+    Bo = max(boiling_number(q_flux, G, sp), EPS)
+    p_r = min(max(P / max(sp.p_crit, EPS), 0.0), 0.999999)
+    R_LL = (
+        0.437
+        * (sp.rho_g / max(sp.rho_l, EPS)) ** 0.073
+        * (sp.rho_l * sp.sigma / max(G**2, EPS)) ** 0.24
+        * Dh**0.72
+        / Bo
+    ) ** (1.0 / 0.96)
+    x_di = (
+        0.4695
+        * (4.0 * abs(q_flux) * R_LL / max(G * Dh * sp.h_fg, EPS)) ** 1.472
+        * (G**2 * Dh / max(sp.rho_l * sp.sigma, EPS)) ** 0.3024
+        * (Dh / 0.001) ** 0.1836
+        * (1.0 - p_r) ** 1.239
+    )
+    return min(max(float(x_di), 0.0), 1.0), float(R_LL)
+
+
+def dougall_rohsenow_correlation(x: float, G: float, Dh: float, sp: SatWaterProps) -> float:
+    """Dougall & Rohsenow (1963) post-dryout heat-transfer coefficient."""
+    x = clamp_quality(x)
+    two_phase_multiplier = x + (sp.rho_g / max(sp.rho_l, EPS)) * (1.0 - x)
+    Re_equivalent = G * Dh / max(sp.mu_g, EPS) * two_phase_multiplier
+    Nu = 0.023 * max(Re_equivalent, EPS) ** 0.8 * sp.Pr_g**0.4
+    return Nu * sp.k_g / Dh
+
+
+def bergles_rohsenow_onb_superheat(q_flux: float, P: float) -> float:
+    """Bergles & Rohsenow (1964) ONB wall superheat [K].
+
+    P is converted from Pa to bar as required by the supplied correlation;
+    q_flux remains in W/m2.
+    """
+    P_bar = max(P / 1.0e5, EPS)
+    n = 0.463 * P_bar**0.0234
+    return 0.556 * (max(abs(q_flux), EPS) / (1082.0 * P_bar**1.156)) ** n
+
+
+def baburajan_subcooled_boiling_h(
+    G: float,
+    Dh: float,
+    q_flux: float,
+    delta_T_sub_in: float,
+    mu_l_bulk: float,
+    mu_l_wall: float,
+    k_l: float,
+    Pr_l: float,
+    cp_l: float,
+    h_fg: float,
+) -> dict:
+    """Baburajan et al. (2013) subcooled-boiling heat-transfer coefficient."""
+    Re_l = max(G * Dh / max(mu_l_bulk, EPS), EPS)
+    h_sp_l = (
+        0.023
+        * Re_l**0.8
+        * max(Pr_l, EPS) ** 0.4
+        * (mu_l_bulk / max(mu_l_wall, EPS)) ** 0.262
+        * k_l
+        / Dh
+    )
+    Bo = max(abs(q_flux) / max(G * h_fg, EPS), EPS)
+    Ja_star = max(cp_l * max(delta_T_sub_in, EPS) / max(h_fg, EPS), EPS)
+    psi = 267.0 * Bo**0.86 * Ja_star**-0.6 * max(Pr_l, EPS) ** 0.23
+    return {
+        "h": max(psi * h_sp_l, EPS),
+        "h_sp_l": h_sp_l,
+        "psi": psi,
+        "Bo": Bo,
+        "Ja_star": Ja_star,
+        "Re_l": Re_l,
+    }
 
 
 def liquid_froude(G: float, Dh: float, sp: SatWaterProps) -> float:
@@ -259,23 +341,36 @@ def two_phase_boiling_h(
     key = name.lower().replace("&", "and").replace(" ", "_").replace("-", "_")
 
     if key in {"chen", "chen_correlation"}:
-        h = chen_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
+        h_pre_dryout = chen_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
     elif key in {"shah", "shah_correlation"}:
-        h = shah_correlation(x, G, Dh, q_flux, h_sp_l, sp)
+        h_pre_dryout = shah_correlation(x, G, Dh, q_flux, h_sp_l, sp)
     elif key in {"gungor_winterton", "gungor_and_winterton", "gungor_winterton_correlation"}:
-        h = gungor_winterton_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
+        h_pre_dryout = gungor_winterton_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
     elif key in {"bertsch", "bertsch_et_al", "bertsch_correlation"}:
-        h = bertsch_correlation(x, G, Dh, q_flux, P, L, sp)
+        h_pre_dryout = bertsch_correlation(x, G, Dh, q_flux, P, L, sp)
     elif key in {"kim_mudawar", "kim_and_mudawar", "kim_mudawar_correlation"}:
-        h = kim_mudawar_correlation(x, G, Dh, q_flux, P, h_sp_l, sp, heated_perimeter, wetted_perimeter)
+        h_pre_dryout = kim_mudawar_correlation(x, G, Dh, q_flux, P, h_sp_l, sp, heated_perimeter, wetted_perimeter)
     elif key in {"zhang", "zhang_correlation"}:
-        h = zhang_correlation(x, G, Dh, q_flux, P, h_sp_v, h_sp_l, sp)
+        h_pre_dryout = zhang_correlation(x, G, Dh, q_flux, P, h_sp_v, h_sp_l, sp)
     else:
         raise ValueError(f"Unknown boiling correlation: {name}")
 
+    x_di, R_LL = del_col_dryout_quality(G, Dh, q_flux, P, sp)
+    dryout = x >= x_di
+    if dryout:
+        h = dougall_rohsenow_correlation(x, G, Dh, sp)
+        active_correlation = "Dougall-Rohsenow"
+    else:
+        h = h_pre_dryout
+        active_correlation = name
+
     return {
         "h": max(float(h), EPS),
+        "h_pre_dryout": max(float(h_pre_dryout), EPS),
         "x": x,
+        "x_di": x_di,
+        "R_LL": R_LL,
+        "dryout": dryout,
         "T_sat": sp.T_sat,
         "Bo": boiling_number(q_flux, G, sp),
         "Co": convection_number(x, sp),
@@ -284,5 +379,5 @@ def two_phase_boiling_h(
         "mu_mix": 1.0 / (x / sp.mu_g + (1.0 - x) / sp.mu_l),
         "h_sp_l": h_sp_l,
         "h_sp_v": h_sp_v,
-        "correlation": name,
+        "correlation": active_correlation,
     }

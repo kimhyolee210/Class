@@ -62,7 +62,7 @@ class Numeric:
     """수치해석 파라미터."""
     n_nodes:  int   = 20
     tol:      float = 1.0e-3
-    max_iter: int   = 16
+    max_iter: int   = 20
     max_cold_dh_per_cell: float = 1.0e5  # 한 셀 cold 엔탈피 증가 상한 [J/kg]
 
 

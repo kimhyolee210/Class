@@ -67,6 +67,21 @@ def run_simulation():
 
     L, result, x = optimize(geo, hot, cold, target, num)
     x_mid = 0.5 * (x[:-1] + x[1:])
+    dx = L / num.n_nodes
+
+    # Cell evaluation-point fluid and wall temperatures.
+    # q_node is based on one channel, so the corresponding heat-transfer
+    # area is also the one-channel wetted area. Use the same fluid states
+    # used by the solver to keep the convection and wall-conduction
+    # temperature drops consistent with q_node.
+    T_h_bulk = result["T_h"][:-1]
+    T_c_bulk = result["T_c"][:-1]
+    A_ht_cell = np.pi * geo.Dh * dx
+    q_flux_cell_actual = result["q_node"] / A_ht_cell
+    q_flux_wall = result["U"] * np.maximum(T_h_bulk - T_c_bulk, 0.0)
+    T_wall_hot = T_h_bulk - q_flux_wall / np.maximum(result["h_hot"], 1.0e-12)
+    T_wall_cold = T_c_bulk + q_flux_wall / np.maximum(result["h_cold"], 1.0e-12)
+    wall_conduction_delta_T = T_wall_hot - T_wall_cold
 
     # ---- 노드 경계 (N+1 행) ----
     df_nodes = pd.DataFrame({
@@ -86,6 +101,19 @@ def run_simulation():
     # ---- 셀 (N 행) ----
     df_cells = pd.DataFrame({
         "x_mid_m":  x_mid,
+        "T_h_bulk_K": T_h_bulk,
+        "T_c_bulk_K": T_c_bulk,
+        "T_wall_hot_K": T_wall_hot,
+        "T_wall_cold_K": T_wall_cold,
+        "T_h_bulk_C": T_h_bulk - 273.15,
+        "T_c_bulk_C": T_c_bulk - 273.15,
+        "T_wall_hot_C": T_wall_hot - 273.15,
+        "T_wall_cold_C": T_wall_cold - 273.15,
+        "wall_delta_T_K": wall_conduction_delta_T,
+        "q_flux_wall_Wm2": q_flux_wall,
+        "q_flux_cell_actual_Wm2": q_flux_cell_actual,
+        "q_flux_to_atm_CHF_ref": q_flux_wall / 1.0e6,
+        "exceeds_atm_CHF_ref": q_flux_wall >= 1.0e6,
         "h_hot":    result["h_hot"],
         "h_cold":   result["h_cold"],
         "U":        result["U"],
@@ -102,6 +130,28 @@ def run_simulation():
         "dP_h":     result["dP_h"],
         "dP_c":     result["dP_c"],
         "x_cold":  result.get("x_cold", np.full_like(x_mid, -1.0)),
+        "x_di_del_col": result.get("x_di", np.full_like(x_mid, np.nan)),
+        "x_over_x_di": np.divide(
+            result.get("x_cold", np.full_like(x_mid, -1.0)),
+            result.get("x_di", np.full_like(x_mid, np.nan)),
+            out=np.full_like(x_mid, np.nan),
+            where=result.get("x_di", np.zeros_like(x_mid)) > 0.0,
+        ),
+        "R_LL": result.get("R_LL", np.full_like(x_mid, np.nan)),
+        "dryout": result.get("dryout", np.zeros_like(x_mid, dtype=bool)),
+        "active_correlation": result.get("active_correlation", np.full(len(x_mid), "")),
+        "phase_cold": result.get("phase_cold", np.full(len(x_mid), "")),
+        "subcooled_boiling": result.get("subcooled_boiling", np.zeros_like(x_mid, dtype=bool)),
+        "T_sat_cold_K": result.get("T_sat_cold", np.full_like(x_mid, np.nan)),
+        "T_sat_cold_C": result.get("T_sat_cold", np.full_like(x_mid, np.nan)) - 273.15,
+        "T_wall_cold_est_K": result.get("T_wall_cold_est", np.full_like(x_mid, np.nan)),
+        "T_wall_cold_est_C": result.get("T_wall_cold_est", np.full_like(x_mid, np.nan)) - 273.15,
+        "wall_superheat_sat_K": result.get("wall_superheat_sat", np.full_like(x_mid, np.nan)),
+        "delta_T_onb_K": result.get("delta_T_onb", np.full_like(x_mid, np.nan)),
+        "Ja_star": result.get("Ja_star", np.full_like(x_mid, np.nan)),
+        "psi_subcooled": result.get("psi_subcooled", np.full_like(x_mid, np.nan)),
+        "h_sp_l_subcooled": result.get("h_sp_l_subcooled", np.full_like(x_mid, np.nan)),
+        "h_cold_pre_dryout": result.get("h_cold_pre_dryout", np.full_like(x_mid, np.nan)),
         "q_flux_est_Wm2": result.get("q_flux_est", np.full_like(x_mid, np.nan)),
     })
 
@@ -132,8 +182,17 @@ def run_simulation():
         "Q_hot_W":         float(Q_hot),
         "Q_cold_W":        float(Q_cold),
         "U_avg_Wm2K":      float(np.mean(result["U"])),
+        "T_wall_hot_min_C": float(np.min(T_wall_hot) - 273.15),
+        "T_wall_hot_max_C": float(np.max(T_wall_hot) - 273.15),
+        "T_wall_cold_min_C": float(np.min(T_wall_cold) - 273.15),
+        "T_wall_cold_max_C": float(np.max(T_wall_cold) - 273.15),
         "boiling_correlation": geo.boiling_correlation,
         "max_cold_quality": float(np.nanmax(result.get("x_cold", [-1.0]))),
+        "min_dryout_quality_x_di": float(np.nanmin(result.get("x_di", [np.nan]))),
+        "dryout_cell_count": int(np.count_nonzero(result.get("dryout", []))),
+        "subcooled_boiling_cell_count": int(np.count_nonzero(result.get("subcooled_boiling", []))),
+        "max_q_flux_wall_Wm2": float(np.max(q_flux_wall)),
+        "max_q_flux_to_atm_CHF_ref": float(np.max(q_flux_wall) / 1.0e6),
         "optimizer_converged": bool(result.get("converged", False)),
         "target_residual_K": float(result.get("target_residual_K", result["T_c"][0] - target.T_cold_out)),
     }
@@ -155,6 +214,15 @@ def run_simulation():
     print(f"  Q  : total / hot / cold = "
           f"{Q_total/1e3:8.2f} / {Q_hot/1e3:8.2f} / {Q_cold/1e3:8.2f}  kW")
     print(f"  U_avg             = {summary['U_avg_Wm2K']:10.2f}  W/m²K")
+    print(f"  Wall T hot min/max  = {summary['T_wall_hot_min_C']:7.2f} / "
+          f"{summary['T_wall_hot_max_C']:7.2f}  °C")
+    print(f"  Wall T cold min/max = {summary['T_wall_cold_min_C']:7.2f} / "
+          f"{summary['T_wall_cold_max_C']:7.2f}  °C")
+    print(f"  Dryout cells       = {summary['dryout_cell_count']:10d}  "
+          f"(min x_di={summary['min_dryout_quality_x_di']:.4f})")
+    print(f"  Subcooled boiling  = {summary['subcooled_boiling_cell_count']:10d}  cells")
+    print(f"  Max wall q''       = {summary['max_q_flux_wall_Wm2']/1.0e6:10.4f}  MW/m² "
+          f"({summary['max_q_flux_to_atm_CHF_ref']:.3f} × 1 MW/m² atm reference)")
     print("-" * 64)
     print(f"  CSV saved:")
     print(f"    {NODES_CSV.name}")
@@ -186,6 +254,20 @@ def load_and_plot():
     ax = axes[0, 0]
     ax.plot(df_nodes["x_m"], df_nodes["T_h_C"], "r-",  lw=1.6, label="Hot Water")
     ax.plot(df_nodes["x_m"], df_nodes["T_c_C"], "b-",  lw=1.6, label="Cold Water")
+    ax.plot(df_cells["x_mid_m"], df_cells["T_wall_hot_C"], color="darkorange",
+            linestyle="--", lw=1.4, label="Hot-side Wall")
+    ax.plot(df_cells["x_mid_m"], df_cells["T_wall_cold_C"], color="teal",
+            linestyle="--", lw=1.4, label="Cold-side Wall")
+    valid_tsat = df_cells["T_sat_cold_C"].notna()
+    ax.plot(df_cells.loc[valid_tsat, "x_mid_m"], df_cells.loc[valid_tsat, "T_sat_cold_C"],
+            color="gray", linestyle=":", lw=1.3, label="Cold Saturation")
+    subcooled_cells = df_cells[
+        df_cells["subcooled_boiling"].astype(str).str.lower() == "true"
+    ]
+    if not subcooled_cells.empty:
+        ax.scatter(subcooled_cells["x_mid_m"], subcooled_cells["T_wall_cold_C"],
+                   color="magenta", marker="^", s=32, zorder=4,
+                   label="Subcooled Boiling")
     ax.axhline(target_C, color="k", linestyle=":", lw=0.9,
                label=f"Target {target_C:.0f} °C")
     ax.set_xlabel("Axial position x [m]")
@@ -221,13 +303,28 @@ def load_and_plot():
     ax.set_title("Reynolds Number")
     ax.grid(alpha=0.3); ax.legend()
 
-    # (1,1) Nusselt
+    # (1,1) vapor quality and Del Col dryout-inception quality
     ax = axes[1, 1]
-    ax.plot(df_cells["x_mid_m"], df_cells["Nu_hot"],  "r-", lw=1.4, label="Nu_hot")
-    ax.plot(df_cells["x_mid_m"], df_cells["Nu_cold"], "b-", lw=1.4, label="Nu_cold")
+    two_phase_cells = df_cells[
+        (df_cells["x_cold"] > 0.0)
+        & (df_cells["x_cold"] < 1.0)
+        & (df_cells["x_di_del_col"] > 0.0)
+    ]
+    ax.plot(two_phase_cells["x_mid_m"], two_phase_cells["x_cold"],
+            "b-", marker="o", markersize=3, lw=1.5, label="x")
+    ax.plot(two_phase_cells["x_mid_m"], two_phase_cells["x_di_del_col"],
+            "k--", marker="s", markersize=3, lw=1.5,
+            label="x_di (Del Col)")
+    dryout_cells = two_phase_cells[
+        two_phase_cells["dryout"].astype(str).str.lower() == "true"
+    ]
+    if not dryout_cells.empty:
+        ax.scatter(dryout_cells["x_mid_m"], dryout_cells["x_cold"],
+                   color="red", s=24, zorder=3, label="Dougall-Rohsenow")
     ax.set_xlabel("Axial position x [m]")
-    ax.set_ylabel("Nusselt Number")
-    ax.set_title("Nusselt Number")
+    ax.set_ylabel("Vapor quality [-]")
+    ax.set_title("Dryout Criterion")
+    ax.set_yscale("log")
     ax.grid(alpha=0.3); ax.legend()
 
     # (1,2) 누적 열량

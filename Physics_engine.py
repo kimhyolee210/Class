@@ -9,7 +9,12 @@ correlation in Geometry.boiling_correlation is used through correlation.py.
 import numpy as np
 
 from Data_model import Geometry, props_PT, phase_quality_PH
-from correlation import saturated_water_props, two_phase_boiling_h
+from correlation import (
+    baburajan_subcooled_boiling_h,
+    bergles_rohsenow_onb_superheat,
+    saturated_water_props,
+    two_phase_boiling_h,
+)
 
 
 def nusselt_DB(Re, Pr, mode):
@@ -56,12 +61,14 @@ def _two_phase_cold_transport(state, Dh, A_flow, h_hot, R_wall, geo):
     if H is None:
         return _single_phase_transport(state, Dh, A_flow, mode="heating")
 
-    x_raw = phase_quality_PH(state["P"], H, state["fluid"])
-    if not (0.0 < x_raw < 1.0):
+    sp = saturated_water_props(state["P"], state["fluid"])
+    if H < sp.h_l:
+        return _subcooled_cold_transport(state, Dh, A_flow, h_hot, R_wall)
+    if H > sp.h_g:
         return _single_phase_transport(state, Dh, A_flow, mode="heating")
+    x_raw = (H - sp.h_l) / max(sp.h_fg, 1.0e-12)
 
     # Initial heat-flux estimate using saturated-liquid single-phase h.
-    sp = saturated_water_props(state["P"], state["fluid"])
     G = state["mdot"] / A_flow
     h_liq = _single_phase_transport(
         {"T": sp.T_sat - 0.01, "P": state["P"], "mdot": state["mdot"], "fluid": state["fluid"]},
@@ -94,6 +101,75 @@ def _two_phase_cold_transport(state, Dh, A_flow, h_hot, R_wall, geo):
         "h": tp["h"], "f": f, "quality": tp["x"], "phase": "two-phase",
         "correlation": tp["correlation"], "T_sat": tp["T_sat"],
         "Bo": tp["Bo"], "Co": tp["Co"], "Xtt": tp["Xtt"],
+        "x_di": tp["x_di"], "R_LL": tp["R_LL"], "dryout": tp["dryout"],
+        "h_pre_dryout": tp["h_pre_dryout"],
+        "q_flux_est": q_flux,
+    }
+
+
+def _subcooled_cold_transport(state, Dh, A_flow, h_hot, R_wall):
+    """Apply ONB criterion and Baburajan subcooled-boiling correlation."""
+    base = _single_phase_transport(state, Dh, A_flow, mode="heating")
+    sp = saturated_water_props(state["P"], state["fluid"])
+    G = state["mdot"] / A_flow
+    T_bulk = state["T"]
+    T_hot = state.get("T_hot_ref", T_bulk)
+    U = 1.0 / (1.0 / h_hot + R_wall + 1.0 / base["h"])
+    q_flux = max(U * (T_hot - T_bulk), 0.0)
+    T_wall = T_bulk + q_flux / max(base["h"], 1.0e-12)
+    delta_T_onb = bergles_rohsenow_onb_superheat(q_flux, state["P"])
+    wall_superheat_sat = T_wall - sp.T_sat
+    subcooled_boiling = wall_superheat_sat >= delta_T_onb and q_flux > 0.0
+
+    if not subcooled_boiling:
+        return {
+            **base,
+            "quality": phase_quality_PH(state["P"], state["H"], state["fluid"]),
+            "phase": "subcooled-liquid",
+            "T_sat": sp.T_sat,
+            "T_wall_est": T_wall,
+            "wall_superheat_sat": wall_superheat_sat,
+            "delta_T_onb": delta_T_onb,
+            "subcooled_boiling": False,
+            "q_flux_est": q_flux,
+        }
+
+    delta_T_sub_in = max(sp.T_sat - state.get("T_inlet_ref", T_bulk), 1.0e-6)
+    babu = None
+    h = base["h"]
+    for _ in range(5):
+        U = 1.0 / (1.0 / h_hot + R_wall + 1.0 / h)
+        q_flux = max(U * (T_hot - T_bulk), 1.0e-6)
+        babu = baburajan_subcooled_boiling_h(
+            G=G,
+            Dh=Dh,
+            q_flux=q_flux,
+            delta_T_sub_in=delta_T_sub_in,
+            mu_l_bulk=base["props"]["mu"],
+            mu_l_wall=sp.mu_l,
+            k_l=base["props"]["k"],
+            Pr_l=base["props"]["Pr"],
+            cp_l=base["props"]["cp"],
+            h_fg=sp.h_fg,
+        )
+        h = babu["h"]
+
+    T_wall = T_bulk + q_flux / max(h, 1.0e-12)
+    return {
+        **base,
+        "h": h,
+        "Nu": h * Dh / max(base["props"]["k"], 1.0e-12),
+        "quality": phase_quality_PH(state["P"], state["H"], state["fluid"]),
+        "phase": "subcooled-boiling",
+        "correlation": "Baburajan",
+        "T_sat": sp.T_sat,
+        "T_wall_est": T_wall,
+        "wall_superheat_sat": T_wall - sp.T_sat,
+        "delta_T_onb": delta_T_onb,
+        "subcooled_boiling": True,
+        "Ja_star": babu["Ja_star"],
+        "psi_subcooled": babu["psi"],
+        "h_sp_l_subcooled": babu["h_sp_l"],
         "q_flux_est": q_flux,
     }
 
@@ -121,7 +197,19 @@ def compute_node(state_hot, state_cold, geo: Geometry):
         "props_hot": hot["props"], "props_cold": cold["props"],
         "A_flow": A_flow, "R_wall": R_wall,
         "x_cold": cold.get("quality", -1.0),
-        "phase_cold": cold.get("phase", "single"),
         "boiling_correlation": cold.get("correlation", "Dittus-Boelter"),
+        "phase_cold": cold.get("phase", "single"),
+        "subcooled_boiling": cold.get("subcooled_boiling", False),
+        "T_sat_cold": cold.get("T_sat", np.nan),
+        "T_wall_cold_est": cold.get("T_wall_est", np.nan),
+        "wall_superheat_sat": cold.get("wall_superheat_sat", np.nan),
+        "delta_T_onb": cold.get("delta_T_onb", np.nan),
+        "Ja_star": cold.get("Ja_star", np.nan),
+        "psi_subcooled": cold.get("psi_subcooled", np.nan),
+        "h_sp_l_subcooled": cold.get("h_sp_l_subcooled", np.nan),
+        "x_di": cold.get("x_di", np.nan),
+        "R_LL": cold.get("R_LL", np.nan),
+        "dryout": cold.get("dryout", False),
+        "h_pre_dryout": cold.get("h_pre_dryout", cold["h"]),
         "q_flux_est": cold.get("q_flux_est", np.nan),
     }

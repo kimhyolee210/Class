@@ -49,6 +49,15 @@ def _allocate_arrays(N):
         "v_hot":  np.zeros(N), "v_cold":  np.zeros(N),
         "q_node": np.zeros(N), "dP_h":    np.zeros(N), "dP_c":   np.zeros(N),
         "x_cold": np.full(N, -1.0), "q_flux_est": np.full(N, np.nan),
+        "x_di": np.full(N, np.nan), "R_LL": np.full(N, np.nan),
+        "dryout": np.zeros(N, dtype=bool), "h_cold_pre_dryout": np.full(N, np.nan),
+        "active_correlation": np.full(N, "", dtype=object),
+        "phase_cold": np.full(N, "", dtype=object),
+        "subcooled_boiling": np.zeros(N, dtype=bool),
+        "T_sat_cold": np.full(N, np.nan), "T_wall_cold_est": np.full(N, np.nan),
+        "wall_superheat_sat": np.full(N, np.nan), "delta_T_onb": np.full(N, np.nan),
+        "Ja_star": np.full(N, np.nan), "psi_subcooled": np.full(N, np.nan),
+        "h_sp_l_subcooled": np.full(N, np.nan),
     }
 
 
@@ -84,6 +93,7 @@ def forward_sweep(L, geo: Geometry,
         state_c = {
             "T": arr["T_c"][i], "P": arr["P_c"][i], "mdot": mdot_c_per_ch,
             "fluid": cold.fluid, "H": arr["H_c"][i], "dx": dx,
+            "T_inlet_ref": cold.T_in,
         }
 
         info = compute_node(state_h, state_c, geo)
@@ -113,6 +123,20 @@ def forward_sweep(L, geo: Geometry,
         arr["q_node"][i] = q_node
         arr["dP_h"][i]   = dP_h;           arr["dP_c"][i]    = dP_c
         arr["x_cold"][i] = info.get("x_cold", -1.0)
+        arr["x_di"][i] = info.get("x_di", np.nan)
+        arr["R_LL"][i] = info.get("R_LL", np.nan)
+        arr["dryout"][i] = info.get("dryout", False)
+        arr["h_cold_pre_dryout"][i] = info.get("h_pre_dryout", info["h_cold"])
+        arr["active_correlation"][i] = info.get("boiling_correlation", "Dittus-Boelter")
+        arr["phase_cold"][i] = info.get("phase_cold", "single")
+        arr["subcooled_boiling"][i] = info.get("subcooled_boiling", False)
+        arr["T_sat_cold"][i] = info.get("T_sat_cold", np.nan)
+        arr["T_wall_cold_est"][i] = info.get("T_wall_cold_est", np.nan)
+        arr["wall_superheat_sat"][i] = info.get("wall_superheat_sat", np.nan)
+        arr["delta_T_onb"][i] = info.get("delta_T_onb", np.nan)
+        arr["Ja_star"][i] = info.get("Ja_star", np.nan)
+        arr["psi_subcooled"][i] = info.get("psi_subcooled", np.nan)
+        arr["h_sp_l_subcooled"][i] = info.get("h_sp_l_subcooled", np.nan)
         arr["q_flux_est"][i] = info.get("q_flux_est", np.nan)
 
     return arr
