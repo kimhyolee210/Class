@@ -28,6 +28,7 @@ class Geometry:
     k_wall:     float = 20.0        # 벽 열전도도 [W/m/K]
     N_channels: int   = 5000        # 평행 채널 수 (per-side, PCHE)
     boiling_correlation: str = "Chen"  # cold side 비등 상관식 선택
+    dryout_transition_width: float = 0.20  # coarse-grid x_di 주변 상관식 완화 구간 폭
 
 
 @dataclass(frozen=True)

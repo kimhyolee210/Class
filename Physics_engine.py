@@ -87,6 +87,7 @@ def _two_phase_cold_transport(state, Dh, A_flow, h_hot, R_wall, geo):
         P=state["P"],
         L=state.get("L_node", Dh),
         fluid=state["fluid"],
+        dryout_transition_width=geo.dryout_transition_width,
     )
 
     rho_mix = tp["rho_mix"]
@@ -102,7 +103,8 @@ def _two_phase_cold_transport(state, Dh, A_flow, h_hot, R_wall, geo):
         "correlation": tp["correlation"], "T_sat": tp["T_sat"],
         "Bo": tp["Bo"], "Co": tp["Co"], "Xtt": tp["Xtt"],
         "x_di": tp["x_di"], "R_LL": tp["R_LL"], "dryout": tp["dryout"],
-        "h_pre_dryout": tp["h_pre_dryout"],
+        "h_pre_dryout": tp["h_pre_dryout"], "h_post_dryout": tp["h_post_dryout"],
+        "dryout_weight": tp["dryout_weight"],
         "q_flux_est": q_flux,
     }
 
@@ -169,6 +171,7 @@ def _subcooled_cold_transport(state, Dh, A_flow, h_hot, R_wall):
         "subcooled_boiling": True,
         "Ja_star": babu["Ja_star"],
         "psi_subcooled": babu["psi"],
+        "psi_subcooled_raw": babu["psi_raw"],
         "h_sp_l_subcooled": babu["h_sp_l"],
         "q_flux_est": q_flux,
     }
@@ -206,10 +209,13 @@ def compute_node(state_hot, state_cold, geo: Geometry):
         "delta_T_onb": cold.get("delta_T_onb", np.nan),
         "Ja_star": cold.get("Ja_star", np.nan),
         "psi_subcooled": cold.get("psi_subcooled", np.nan),
+        "psi_subcooled_raw": cold.get("psi_subcooled_raw", np.nan),
         "h_sp_l_subcooled": cold.get("h_sp_l_subcooled", np.nan),
         "x_di": cold.get("x_di", np.nan),
         "R_LL": cold.get("R_LL", np.nan),
         "dryout": cold.get("dryout", False),
         "h_pre_dryout": cold.get("h_pre_dryout", cold["h"]),
+        "h_post_dryout": cold.get("h_post_dryout", cold["h"]),
+        "dryout_weight": cold.get("dryout_weight", 0.0),
         "q_flux_est": cold.get("q_flux_est", np.nan),
     }

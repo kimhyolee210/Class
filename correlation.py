@@ -22,7 +22,7 @@ phase heat-transfer coefficient.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import exp, log10, pi, sqrt
+from math import exp, log, log10, pi, sqrt
 
 from CoolProp.CoolProp import PropsSI
 
@@ -194,11 +194,13 @@ def baburajan_subcooled_boiling_h(
     )
     Bo = max(abs(q_flux) / max(G * h_fg, EPS), EPS)
     Ja_star = max(cp_l * max(delta_T_sub_in, EPS) / max(h_fg, EPS), EPS)
-    psi = 267.0 * Bo**0.86 * Ja_star**-0.6 * max(Pr_l, EPS) ** 0.23
+    psi_raw = 267.0 * Bo**0.86 * Ja_star**-0.6 * max(Pr_l, EPS) ** 0.23
+    psi = max(1.0, psi_raw)
     return {
         "h": max(psi * h_sp_l, EPS),
         "h_sp_l": h_sp_l,
         "psi": psi,
+        "psi_raw": psi_raw,
         "Bo": Bo,
         "Ja_star": Ja_star,
         "Re_l": Re_l,
@@ -332,6 +334,7 @@ def two_phase_boiling_h(
     fluid: str = "Water",
     heated_perimeter: float | None = None,
     wetted_perimeter: float | None = None,
+    dryout_transition_width: float = 0.06,
 ) -> dict:
     """Dispatch one boiling correlation and return h plus useful intermediate data."""
     sp = saturated_water_props(P, fluid)
@@ -339,34 +342,47 @@ def two_phase_boiling_h(
     h_sp_l = dittus_boelter_h(G, Dh, sp.mu_l, sp.k_l, sp.Pr_l, n=0.4)
     h_sp_v = dittus_boelter_h(G, Dh, sp.mu_g, sp.k_g, sp.Pr_g, n=0.4)
     key = name.lower().replace("&", "and").replace(" ", "_").replace("-", "_")
+    x_di, R_LL = del_col_dryout_quality(G, Dh, q_flux, P, sp)
+    x_pre_eval = min(x, x_di)
 
     if key in {"chen", "chen_correlation"}:
-        h_pre_dryout = chen_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
+        h_pre_dryout = chen_correlation(x_pre_eval, G, Dh, q_flux, P, h_sp_l, sp)
     elif key in {"shah", "shah_correlation"}:
-        h_pre_dryout = shah_correlation(x, G, Dh, q_flux, h_sp_l, sp)
+        h_pre_dryout = shah_correlation(x_pre_eval, G, Dh, q_flux, h_sp_l, sp)
     elif key in {"gungor_winterton", "gungor_and_winterton", "gungor_winterton_correlation"}:
-        h_pre_dryout = gungor_winterton_correlation(x, G, Dh, q_flux, P, h_sp_l, sp)
+        h_pre_dryout = gungor_winterton_correlation(x_pre_eval, G, Dh, q_flux, P, h_sp_l, sp)
     elif key in {"bertsch", "bertsch_et_al", "bertsch_correlation"}:
-        h_pre_dryout = bertsch_correlation(x, G, Dh, q_flux, P, L, sp)
+        h_pre_dryout = bertsch_correlation(x_pre_eval, G, Dh, q_flux, P, L, sp)
     elif key in {"kim_mudawar", "kim_and_mudawar", "kim_mudawar_correlation"}:
-        h_pre_dryout = kim_mudawar_correlation(x, G, Dh, q_flux, P, h_sp_l, sp, heated_perimeter, wetted_perimeter)
+        h_pre_dryout = kim_mudawar_correlation(x_pre_eval, G, Dh, q_flux, P, h_sp_l, sp, heated_perimeter, wetted_perimeter)
     elif key in {"zhang", "zhang_correlation"}:
-        h_pre_dryout = zhang_correlation(x, G, Dh, q_flux, P, h_sp_v, h_sp_l, sp)
+        h_pre_dryout = zhang_correlation(x_pre_eval, G, Dh, q_flux, P, h_sp_v, h_sp_l, sp)
     else:
         raise ValueError(f"Unknown boiling correlation: {name}")
 
-    x_di, R_LL = del_col_dryout_quality(G, Dh, q_flux, P, sp)
+    h_post_dryout = dougall_rohsenow_correlation(x, G, Dh, sp)
+    width = max(float(dryout_transition_width), 1.0e-6)
+    transition_coordinate = min(max((x - (x_di - 0.5 * width)) / width, 0.0), 1.0)
+    dryout_weight = transition_coordinate**2 * (3.0 - 2.0 * transition_coordinate)
     dryout = x >= x_di
-    if dryout:
-        h = dougall_rohsenow_correlation(x, G, Dh, sp)
+    if dryout_weight >= 1.0:
+        h = h_post_dryout
         active_correlation = "Dougall-Rohsenow"
-    else:
+    elif dryout_weight <= 0.0:
         h = h_pre_dryout
         active_correlation = name
+    else:
+        h = exp(
+            (1.0 - dryout_weight) * log(max(h_pre_dryout, EPS))
+            + dryout_weight * log(max(h_post_dryout, EPS))
+        )
+        active_correlation = "Dryout transition"
 
     return {
         "h": max(float(h), EPS),
         "h_pre_dryout": max(float(h_pre_dryout), EPS),
+        "h_post_dryout": max(float(h_post_dryout), EPS),
+        "dryout_weight": dryout_weight,
         "x": x,
         "x_di": x_di,
         "R_LL": R_LL,

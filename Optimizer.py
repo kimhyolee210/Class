@@ -51,12 +51,14 @@ def _allocate_arrays(N):
         "x_cold": np.full(N, -1.0), "q_flux_est": np.full(N, np.nan),
         "x_di": np.full(N, np.nan), "R_LL": np.full(N, np.nan),
         "dryout": np.zeros(N, dtype=bool), "h_cold_pre_dryout": np.full(N, np.nan),
+        "h_cold_post_dryout": np.full(N, np.nan), "dryout_weight": np.zeros(N),
         "active_correlation": np.full(N, "", dtype=object),
         "phase_cold": np.full(N, "", dtype=object),
         "subcooled_boiling": np.zeros(N, dtype=bool),
         "T_sat_cold": np.full(N, np.nan), "T_wall_cold_est": np.full(N, np.nan),
         "wall_superheat_sat": np.full(N, np.nan), "delta_T_onb": np.full(N, np.nan),
         "Ja_star": np.full(N, np.nan), "psi_subcooled": np.full(N, np.nan),
+        "psi_subcooled_raw": np.full(N, np.nan),
         "h_sp_l_subcooled": np.full(N, np.nan),
     }
 
@@ -127,6 +129,8 @@ def forward_sweep(L, geo: Geometry,
         arr["R_LL"][i] = info.get("R_LL", np.nan)
         arr["dryout"][i] = info.get("dryout", False)
         arr["h_cold_pre_dryout"][i] = info.get("h_pre_dryout", info["h_cold"])
+        arr["h_cold_post_dryout"][i] = info.get("h_post_dryout", info["h_cold"])
+        arr["dryout_weight"][i] = info.get("dryout_weight", 0.0)
         arr["active_correlation"][i] = info.get("boiling_correlation", "Dittus-Boelter")
         arr["phase_cold"][i] = info.get("phase_cold", "single")
         arr["subcooled_boiling"][i] = info.get("subcooled_boiling", False)
@@ -136,6 +140,7 @@ def forward_sweep(L, geo: Geometry,
         arr["delta_T_onb"][i] = info.get("delta_T_onb", np.nan)
         arr["Ja_star"][i] = info.get("Ja_star", np.nan)
         arr["psi_subcooled"][i] = info.get("psi_subcooled", np.nan)
+        arr["psi_subcooled_raw"][i] = info.get("psi_subcooled_raw", np.nan)
         arr["h_sp_l_subcooled"][i] = info.get("h_sp_l_subcooled", np.nan)
         arr["q_flux_est"][i] = info.get("q_flux_est", np.nan)
 

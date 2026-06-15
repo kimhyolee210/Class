@@ -150,8 +150,11 @@ def run_simulation():
         "delta_T_onb_K": result.get("delta_T_onb", np.full_like(x_mid, np.nan)),
         "Ja_star": result.get("Ja_star", np.full_like(x_mid, np.nan)),
         "psi_subcooled": result.get("psi_subcooled", np.full_like(x_mid, np.nan)),
+        "psi_subcooled_raw": result.get("psi_subcooled_raw", np.full_like(x_mid, np.nan)),
         "h_sp_l_subcooled": result.get("h_sp_l_subcooled", np.full_like(x_mid, np.nan)),
         "h_cold_pre_dryout": result.get("h_cold_pre_dryout", np.full_like(x_mid, np.nan)),
+        "h_cold_post_dryout": result.get("h_cold_post_dryout", np.full_like(x_mid, np.nan)),
+        "dryout_weight": result.get("dryout_weight", np.zeros_like(x_mid)),
         "q_flux_est_Wm2": result.get("q_flux_est", np.full_like(x_mid, np.nan)),
     })
 
